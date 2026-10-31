@@ -17,6 +17,7 @@ const POLL_TIMEOUT_MS = Number(process.env.QQBOT_POLL_TIMEOUT_MS || 120000);   /
 const SEARCH_TIMEOUT_MS = 90000;                           // 搜索接口偶尔较慢，给足时间
 const EMPTY_RETRY_MAX = 2;                                 // 搜索返回空结果时，最多再重试几次
 const EMPTY_RETRY_GAP_MS = Number(process.env.QQBOT_EMPTY_RETRY_MS || 6000); // 空结果重试的间隔
+const MAX_CANDIDATE_TRIES = 3;                             // 候选源失效/无链接时，最多顺延试几个候选
 const MAX_KEYWORD_LEN = 60;
 const OWNER_ID = '731121979';                              // 主人主号 QQ，只有他能触发云更新
 // 云更新共享目录：手机模块里容器内是 /shared（宿主机 /data/qqbot/shared 的 bind 挂载）；
@@ -227,6 +228,61 @@ function messageText(ev) {
 
 /* ---------------- 业务流程 ---------------- */
 
+/* 单个候选的「提交 + 轮询」全流程，供 handleSearch 的候选顺延循环调用。
+ * 拿到链接时自己把链接发到群里并返回 'ok'；源已被取消（dead_source）、
+ * 转存失败、转完没生成链接、或轮询超时，一律返回 'fail'，由调用方静默
+ * 换下一个候选——群里不发任何消息，免得像 2026-11-01 00:50 那次一样，
+ * 第一个候选的源被原主取消（夸克 41012）就误报「已转存好但没生成新链接」。
+ * 返回 'filtered' 表示内容被过滤（对这个关键词整体的判定，调用方收尾）。 */
+async function tryCandidate(groupId, cand, keyword) {
+  const title = itemTitle(cand, keyword);
+  let created;
+  try {
+    created = await submitTask(cand.ref);
+  } catch (e) {
+    log('提交转存出错（该候选作罢）:', e.message);
+    return 'fail';
+  }
+  if (created && created.filtered) return 'filtered';
+  const task = (created && created.task) || created || {};
+  if (!task.id) {
+    log('提交转存没返回任务 id（该候选作罢）:', title);
+    return 'fail';
+  }
+  if (task.status === 'done' && task.share_url) {
+    sendGroupMsg(groupId, `《${title}》\n${task.share_url}`);
+    return 'ok';
+  }
+  if (['dead_source', 'failed', 'error', 'blocked', 'cancelled'].includes(task.status)) {
+    log(`候选提交即处于 ${task.status} 状态（该候选作罢）:`, title);
+    return 'fail';
+  }
+  // 轮询等转存完成
+  let sawDoneNoLink = false;
+  const deadline = Date.now() + POLL_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+    let t;
+    try { t = await getTask(task.id); } catch { continue; }
+    if (t.status === 'done' && t.share_url) {
+      sendGroupMsg(groupId, `《${title}》转存好了\n${t.share_url}`);
+      return 'ok';
+    }
+    if (t.status === 'done' || t.status === 'done_pending_share') {
+      // 转存已完成但分享链接还没生成（后端要晚几秒），继续等，别抢跑下结论
+      sawDoneNoLink = true;
+    }
+    if (['dead_source', 'failed', 'error', 'blocked', 'cancelled'].includes(t.status)) {
+      log(`候选任务状态 ${t.status}（该候选作罢）:`, title);
+      return 'fail';
+    }
+  }
+  // 轮询超时收场：转完却一直没链接（sawDoneNoLink）或一直没转完，
+  // 都算这个候选不行，换下一个（不再单独回「没生成新链接/还在转存中」）。
+  log(sawDoneNoLink ? '候选转存完成但始终没生成链接（该候选作罢）:' : '候选转存超时（该候选作罢）:', title);
+  return 'fail';
+}
+
 async function handleSearch(groupId, keyword) {
   sendGroupMsg(groupId, `正在找《${keyword}》，找到后会自动转存，好了就把链接发到群里。`);
   let items;
@@ -286,54 +342,29 @@ async function handleSearch(groupId, keyword) {
     sendGroupMsg(groupId, `《${keyword}》只找到小说版，影视版暂时没有，小说以后再说。`);
     return;
   }
-  const cand = fresh.item;
-  const title = itemTitle(cand, keyword);
-  let created;
-  try {
-    created = await submitTask(cand.ref);
-  } catch (e) {
-    log('提交转存出错:', e.message);
-    sendGroupMsg(groupId, '服务暂时开小差了，过一会儿再发一次试试。');
-    return;
-  }
-  if (created && created.filtered) {
-    sendGroupMsg(groupId, `《${keyword}》这类内容被过滤了，换一部试试。`);
-    return;
-  }
-  const task = (created && created.task) || created || {};
-  if (!task.id) {
-    sendGroupMsg(groupId, `《${title}》提交转存失败了，稍后再试试。`);
-    return;
-  }
-  if (task.status === 'done' && task.share_url) {
-    sendGroupMsg(groupId, `《${title}》\n${task.share_url}`);
-    return;
-  }
-  // 轮询等转存完成
-  let sawDoneNoLink = false;
-  const deadline = Date.now() + POLL_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-    let t;
-    try { t = await getTask(task.id); } catch { continue; }
-    if (t.status === 'done' && t.share_url) {
-      sendGroupMsg(groupId, `《${title}》转存好了\n${t.share_url}`);
+  // 候选排名：分数从高到低，同分保持后端顺序（后端已按时间倒序，新资源
+  // 在前）；按 ref 去重。小说版永不进候选——清一色小说时 ranked 为空，
+  // 但上面的 pool.every(小说) 分支已经回过话了，走不到这个循环。
+  const ranked = pool
+    .filter(i => !isNovelItem(i))
+    .map((item, idx) => ({ item, idx, score: scoreItem(item, keyword) }))
+    .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+    .filter((e, i, arr) => arr.findIndex(x => x.item.ref === e.item.ref) === i)
+    .map(e => e.item);
+
+  // 挨个候选试，最多试 MAX_CANDIDATE_TRIES 个：某个源被取消、转存失败
+  // 或转完没链接，都静默顺延到下一个候选。群里全程只有开头那一条
+  // 「正在找」，不再出现「转存好了但没链接」这种误导话术。
+  for (const cand of ranked.slice(0, MAX_CANDIDATE_TRIES)) {
+    const r = await tryCandidate(groupId, cand, keyword);
+    if (r === 'ok') return;
+    if (r === 'filtered') {
+      sendGroupMsg(groupId, `《${keyword}》这类内容被过滤了，换一部试试。`);
       return;
     }
-    if (t.status === 'done' || t.status === 'done_pending_share') {
-      // 转存已完成但分享链接还没生成（后端要晚几秒），继续等，别抢跑下结论
-      sawDoneNoLink = true;
-    }
-    if (['failed', 'error', 'blocked', 'cancelled'].includes(t.status)) {
-      sendGroupMsg(groupId, `《${title}》转存失败了，换一部或者稍后再试。`);
-      return;
-    }
+    // 'fail'：这个候选不行，静默换下一个
   }
-  if (sawDoneNoLink) {
-    sendGroupMsg(groupId, `《${title}》已经转存好了，但这次没生成新链接，去网页版看看：\n${BACKEND}`);
-    return;
-  }
-  sendGroupMsg(groupId, `《${title}》还在转存中，稍后打开网页版就能看到链接：\n${BACKEND}`);
+  sendGroupMsg(groupId, `《${keyword}》找到的几个源都不行，有的链接已经失效了，换个名字或者晚点再试试。`);
 }
 
 /* ---------------- 每日更新日报（21 点自动发群） ----------------
