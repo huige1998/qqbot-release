@@ -5,7 +5,7 @@
     "start_qqbot.sh": {"sha256": "39a989d724de2a07888ca7ea650f43747dd9bd0e035ba3bc598ac794e94884a0", "path": "files/start_qqbot.sh"},
     "stop_qqbot.sh": {"sha256": "12717eb38db1d31613edb3894fd6252846c7b3f672833010a980bcb66d3fe76d", "path": "files/stop_qqbot.sh"},
     "chroot_run.sh": {"sha256": "6de91cafeb3af20a5b180a43038593f07df7ac7e547418e6c32793a5dfa3c379", "path": "files/chroot_run.sh"},
-    "updater.sh": {"sha256": "5f218cfc0e7305f2d3a3e0c260a2315c2cecece1dc6f6ee1fb696ce030374d75", "path": "files/updater.sh"}
+    "updater.sh": {"sha256": "e82bcd2e5768150cab672e415068c1177ec246297c26de00b1a1d32b9eae8e48", "path": "files/updater.sh"}
   }},
   "min_module_versionCode": 2,
   "notes": "v1.1 initial: cloud-update channel established (bot v2, scripts v2)"

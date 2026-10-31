@@ -144,13 +144,18 @@ mget() {
 }
 
 # ---- bot 进程 -----------------------------------------------------------
+# 精确匹配: 某个参数正好是 /root/qqbot/bot.js 且 argv[0] 是 node。
+# 不能用子串匹配——任何"提到这个路径"的 shell/脚本（比如手动排查命令）
+# 都会被误杀。容器里真正的 bot 是 node /root/qqbot/bot.js，参数是精确的。
 find_bot_pid() {
   for _d in /proc/[0-9]*; do
     [ -r "$_d/cmdline" ] || continue
-    _c=$(tr '\0' ' ' < "$_d/cmdline" 2>/dev/null)
-    case "$_c" in
-      *"/root/qqbot/bot.js"*) echo "${_d#/proc/}"; return 0 ;;
-    esac
+    if tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | grep -qx '/root/qqbot/bot.js'; then
+      _exe=$(tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | head -n 1)
+      case "$_exe" in
+        *node*) echo "${_d#/proc/}"; return 0 ;;
+      esac
+    fi
   done
   return 1
 }
