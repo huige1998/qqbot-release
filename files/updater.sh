@@ -317,6 +317,17 @@ do_check() {
 }
 
 # ---- 看护（回滚判定） -------------------------------------------------------
+# 判定材料有两路，互相兜底:
+#  1) 容器内看门狗每次 bot 退出都会往 bot.log 追加一行"[watchdog] bot.js 退出"，
+#     数这行的增量最可靠——采样间隔再长也不会漏掉崩溃循环；
+#  2) /proc 里 bot 进程的 pid 变化（进程活着才采得到，快速崩溃时经常采空）。
+# 80 秒内退出增量 >=3 或 pid 重启 >=3 次 -> 判新版不行，回滚；
+# 整个窗口一次都没见到活着的 bot 进程，也判失败（说明根本没跑起来）。
+BOTLOG="/data/qqbot/rootfs/root/qqbot/bot.log"
+exit_count() {
+  _c=$(grep -c 'bot.js 退出' "$BOTLOG" 2>/dev/null)
+  echo "${_c:-0}"
+}
 do_monitor() { # <备份目录> <旧bot版本> <新bot版本>
   _bk=$1; _old=$2; _new=$3
   MLOCK="$RUN/monitor.lock"
@@ -328,26 +339,31 @@ do_monitor() { # <备份目录> <旧bot版本> <新bot版本>
   trap 'rm -rf "$MLOCK" 2>/dev/null; case "$0" in */updater.exec.*.sh) rm -f "$0" 2>/dev/null ;; esac' EXIT
 
   log "看护开始: 观察 bot v$_new 的启动情况（80 秒）"
-  sleep 3
+  sleep 3  # 等被杀的旧 bot 那行退出日志落盘，基线才准
+  _base_exits=$(exit_count)
   _deadline=$(( $(date +%s) + 80 ))
   _last_pid=""; _restarts=0; _seen=0
   while [ "$(date +%s)" -lt "$_deadline" ]; do
     _p=$(find_bot_pid)
     if [ -n "$_p" ]; then
+      _seen=1
       if [ -z "$_last_pid" ]; then
-        _last_pid=$_p; _seen=1
+        _last_pid=$_p
       elif [ "$_p" != "$_last_pid" ]; then
         _restarts=$((_restarts + 1)); _last_pid=$_p
         log "看护: bot 进程更换（第 $_restarts 次重启）pid=$_p"
       fi
     fi
+    _delta=$(( $(exit_count) - _base_exits ))
+    [ "$_delta" -ge 3 ] && break
     [ "$_restarts" -ge 3 ] && break
     sleep 4
   done
+  _delta=$(( $(exit_count) - _base_exits ))
 
   _cs=$(getv scripts)
-  if [ "$_restarts" -ge 3 ] || [ "$_seen" != "1" ]; then
-    log "看护判定失败（重启 $_restarts 次，见到进程=$_seen），回滚 bot 到 v$_old"
+  if [ "$_delta" -ge 3 ] || [ "$_restarts" -ge 3 ] || [ "$_seen" != "1" ]; then
+    log "看护判定失败（退出增量=$_delta，pid重启=$_restarts，见到活进程=$_seen），回滚 bot 到 v$_old"
     if [ -f "$_bk/bot.js" ]; then
       cp "$_bk/bot.js" "$ROOTFS/root/qqbot/.bot.js.tmp" && mv "$ROOTFS/root/qqbot/.bot.js.tmp" "$BOT_IN_ROOTFS"
     fi
