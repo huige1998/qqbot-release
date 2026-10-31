@@ -19,10 +19,14 @@ mkdir -p "$RUN" "$LOGS" "$SD/logs" 2>/dev/null
 exec >>"$LOGS/start.log" 2>&1
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] start_qqbot 开始"
 
+pid_ours() { # pid_ours <pid>: 活着且命令行带 qqbot 字样才算数（防 pid 被系统回收复用后误判"还在跑"）
+  [ -n "$1" ] || return 1
+  kill -0 "$1" 2>/dev/null || return 1
+  tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q qqbot
+}
 alive() { # alive <pidfile>
   [ -f "$1" ] || return 1
-  p=$(cat "$1" 2>/dev/null)
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+  pid_ours "$(cat "$1" 2>/dev/null)"
 }
 
 if alive "$RUN/napcat.pid"; then

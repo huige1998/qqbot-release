@@ -36,7 +36,11 @@ UPDPID=$DATA/run/updater.pid
 upd_alive=0
 if [ -f "$UPDPID" ]; then
   p=$(cat "$UPDPID" 2>/dev/null)
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && upd_alive=1
+  # 只认"活着且命令行带 qqbot"的 pid，防 pid 复用误判（同 start_qqbot 的 alive）
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null && \
+     tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q qqbot; then
+    upd_alive=1
+  fi
 fi
 if [ "$upd_alive" != "1" ] && [ -f "$BIN/updloop.sh" ]; then
   setsid /system/bin/sh "$BIN/updloop.sh" </dev/null >/dev/null 2>&1 &
