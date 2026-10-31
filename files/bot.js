@@ -30,6 +30,68 @@ if (typeof WebSocket === 'undefined') {
   process.exit(1);
 }
 
+/* ---------------- 单实例锁 ----------------
+ * 2026-10-31 真机事故：云更新重启 bot 时和看门狗的重启撞在一起，两个 bot.js
+ * 进程同时活了下来（bot.log 里两条「机器人启动」只差 1 秒），群消息被各回一遍。
+ * v3 的 message_id 去重是进程级的，管不了两个进程，所以在启动最前面加文件锁：
+ * 同一台机器只允许一个 bot.js 持有锁，第二个实例直接退出。
+ * 锁文件默认在 bot.js 同目录（手机上即 /root/qqbot/bot.lock，与 bot.log 同目录；
+ * Windows 一键包里就是 bot.js 旁边），可用环境变量 QQBOT_LOCK_PATH 覆盖。
+ * 注意（pid 回收的极小概率）：失效锁里记的旧 pid 可能被系统分给无关进程，
+ * 那时后来者会误判「已有实例在运行」而退出——看门狗 5 秒后会再拉起重试，
+ * 最坏只是晚一轮接管，绝不会出现双实例。 */
+const LOCK_PATH = process.env.QQBOT_LOCK_PATH || path.join(__dirname, 'bot.lock');
+let lockFd = null; // 非 null 表示本进程是锁持有者
+
+function pidAlive(pid) {
+  if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return !!(e && e.code === 'EPERM'); } // EPERM = 进程在，只是无权发信号
+}
+
+function acquireInstanceLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd;
+    try {
+      fd = fs.openSync(LOCK_PATH, 'wx'); // O_EXCL 原子创建，已存在直接抛 EEXIST
+    } catch (e) {
+      if (e && e.code === 'EEXIST') {
+        let holder = NaN;
+        try { holder = parseInt(fs.readFileSync(LOCK_PATH, 'utf8').trim(), 10); } catch { /* 读不到按失效锁处理 */ }
+        if (pidAlive(holder)) {
+          log(`已有实例在运行 (pid ${holder})，本实例退出`);
+          process.exit(0);
+        }
+        // 失效锁（持有者已死或内容不可解析）：删掉重试一次，接管过来
+        try { fs.unlinkSync(LOCK_PATH); } catch { /* 别人先删了也无妨 */ }
+        continue;
+      }
+      // 其他错误（如目录不可写）：别把机器人挡在门外，记一笔继续无锁启动
+      log('单实例锁创建失败（继续无锁启动）:', e && e.message);
+      return;
+    }
+    try { fs.writeSync(fd, String(process.pid)); } catch { /* 写不进不影响占锁本身 */ }
+    lockFd = fd;
+    return;
+  }
+  // 两次都没抢到：刚被另一实例接管，按「已有实例」处理
+  log('单实例锁已被其他实例接管，本实例退出');
+  process.exit(0);
+}
+
+function releaseInstanceLock() {
+  if (lockFd == null) return; // 不是持有者时绝不能动锁文件（那是别人的锁）
+  try { fs.closeSync(lockFd); } catch { /* 忽略 */ }
+  lockFd = null;
+  try { fs.unlinkSync(LOCK_PATH); } catch { /* 忽略 */ }
+}
+// SIGKILL 无法清理，锁文件会残留——但里面记的 pid 已死，下一个实例会走失效接管，自愈。
+process.on('exit', releaseInstanceLock);
+process.on('SIGTERM', () => { releaseInstanceLock(); process.exit(0); });
+process.on('SIGINT', () => { releaseInstanceLock(); process.exit(0); });
+
+acquireInstanceLock();
+
 /* ---------------- 云端后端调用 ---------------- */
 
 async function fetchJson(url, options = {}, timeoutMs = 30000) {

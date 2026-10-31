@@ -1,5 +1,5 @@
 {
-  "bot": {"version": 3, "sha256": "26b5f36ee7117d26523fe05a2f3e7b9a2a21caee5116cde6b6d2ca1fcc01b599", "path": "files/bot.js"},
+  "bot": {"version": 4, "sha256": "bffbe0925158045c657732c437286afb074b3e7b523b371af26aac7f3a66a73e", "path": "files/bot.js"},
   "scripts": {"version": 3, "files": {
     "run.sh": {"sha256": "891899fcc271cd80390cc1c1166183db4171b5108308cfa0d4aa9f3e7c237b56", "path": "files/run.sh"},
     "start_qqbot.sh": {"sha256": "b9c7ae8af1aaa7e49bbbdc35e87a17a613556a4a1d44841b1465ef806bdfe3c5", "path": "files/start_qqbot.sh"},
@@ -8,5 +8,5 @@
     "updater.sh": {"sha256": "0d09eb2fcb6972431be1a30421295bb8c3d1571e9495ed67410ab1971cc9e9b0", "path": "files/updater.sh"}
   }},
   "min_module_versionCode": 2,
-  "notes": "bot v3: message_id dedup + single-connection dispatch (no duplicate replies); pick video results over novels, novel-only searches are not transferred. scripts stay v3."
+  "notes": "bot v4: single-instance file lock (bot.lock next to bot.js, QQBOT_LOCK_PATH override) - a second bot.js process now exits immediately instead of double-replying; includes all v3 fixes (message_id dedup, video-over-novel pick). scripts stay v3."
 }
