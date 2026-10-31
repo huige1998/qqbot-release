@@ -1,6 +1,6 @@
 {
-  "version": "v1.2",
-  "versionCode": 3,
+  "version": "v1.2.1",
+  "versionCode": 4,
   "zipUrl": "https://raw.githubusercontent.com/huige1998/qqbot-release/main/module.zip",
   "changelog": "https://raw.githubusercontent.com/huige1998/qqbot-release/main/changelog.md"
 }
