@@ -159,14 +159,71 @@ find_bot_pid() {
   done
   return 1
 }
-kill_bot() {
-  _p=$(find_bot_pid)
-  if [ -n "$_p" ]; then
-    kill "$_p" 2>/dev/null
-    log "已终止旧 bot 进程 pid=$_p（容器内看门狗会拉起新版）"
-    return 0
+# ===== 进程清扫（qqbot-sweep: stop_qqbot.sh 与 updater.sh 各一份，内容必须一致） =====
+# pid 文件/进程组只能杀掉"记录在案"的那棵进程树。真机出过事故: 更新重启与
+# 看门狗抢拉撞车，多出一个不在任何 pid 文件里的 bot 孤儿进程——它不是看门狗
+# 的子进程、整组杀杀不到，又是旧版不认 bot v4 的单实例锁，于是和新版一起
+# 各回一条消息。清扫不靠 pid 文件，按 /proc 逐个进程核对命令行精确令牌:
+#   bot 本体: 某个参数正好是 /root/qqbot/bot.js 且 argv[0] 含 node
+#   看门狗:   某个参数正好是 /root/qqbot/start-bot.sh 且 argv[0] 含 sh
+# 令牌按整行精确相等匹配（grep -qx，与更新器 find_bot_pid 同款，已在真机
+# 验证）: 命令行里只是"提到"该路径的排查 shell/grep 等，argv[0] 与令牌
+# 都对不上，不会误杀；脚本自身的 argv 是脚本路径，同样对不上。
+bot_pids_all() {
+  for _d in /proc/[0-9]*; do
+    [ -r "$_d/cmdline" ] || continue
+    if tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | grep -qx '/root/qqbot/bot.js'; then
+      _exe=$(tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | head -n 1)
+      case "$_exe" in *node*) echo "${_d#/proc/}" ;; esac
+    fi
+  done
+}
+watchdog_pids_all() {
+  for _d in /proc/[0-9]*; do
+    [ -r "$_d/cmdline" ] || continue
+    if tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | grep -qx '/root/qqbot/start-bot.sh'; then
+      _exe=$(tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | head -n 1)
+      case "$_exe" in *sh*) echo "${_d#/proc/}" ;; esac
+    fi
+  done
+}
+# 先 TERM 重生者（看门狗）再 TERM 全部 bot，等 2 秒后 KILL 残留，之后再
+# 复查一轮（防看门狗在被 KILL 前的窗口里又拉起一个 bot）。结束时把仍
+# 残留的 bot pid 打到 stdout（正常应为空），调用方据此记日志/告警。
+sweep_bot_processes() {
+  _w=$(watchdog_pids_all); [ -n "$_w" ] && kill $_w 2>/dev/null
+  _b=$(bot_pids_all);      [ -n "$_b" ] && kill $_b 2>/dev/null
+  sleep 2
+  _w=$(watchdog_pids_all); [ -n "$_w" ] && kill -KILL $_w 2>/dev/null
+  _b=$(bot_pids_all);      [ -n "$_b" ] && kill -KILL $_b 2>/dev/null
+  sleep 1
+  _b=$(bot_pids_all)
+  if [ -n "$_b" ]; then
+    _w=$(watchdog_pids_all); [ -n "$_w" ] && kill -KILL $_w 2>/dev/null
+    kill -KILL $_b 2>/dev/null
+    sleep 1
+    _b=$(bot_pids_all)
   fi
-  return 1
+  echo "$_b"
+}
+# ===== 进程清扫结束 =====
+
+# ---- bot 单实例重启 -------------------------------------------------------
+# 换版/回滚后把 bot 收敛到恰好一个实例: 先用上面的清扫把全部 bot 与看门狗
+# 杀干净（孤儿进程一并清掉），再按 start_qqbot.sh 同款方式拉起一个看门狗，
+# 看门狗随即拉起恰好一个 bot（rootfs 里当前那份 bot.js，即刚换上的新版、
+# 或回滚恢复的旧版）。代替旧 kill_bot——旧实现只杀 find_bot_pid 找到的
+# 第一个 pid，多出来的孤儿进程杀不到，会和新版一起各回一条消息。
+# 调用方须先确认 bot 在跑（find_bot_pid 有结果）: 没在跑时不凭空拉起，
+# 用户可能正手动停着机。
+restart_bot_single() {
+  _left=$(sweep_bot_processes)
+  [ -n "$_left" ] && log "警告: 清扫后仍有 bot 进程残留: $_left"
+  _cr="$BIN/chroot_run.sh"
+  [ -f "$_cr" ] || _cr=/data/adb/modules/qqbot-magisk/files/chroot_run.sh
+  setsid /system/bin/sh "$_cr" /root/qqbot/start-bot.sh </dev/null >/dev/null 2>&1 &
+  echo $! > "$RUN/bot.pid"
+  log "bot 已清扫并重启（新看门狗 pid=$(cat "$RUN/bot.pid" 2>/dev/null)，只拉起一个实例）"
 }
 
 # ---- 脚本包更新 -----------------------------------------------------------
@@ -214,7 +271,7 @@ apply_bot() { # <新版本号> <sha256> <仓库相对路径>
   setv bot "$_ver"
   log "bot.js 已更新 v$_old -> v$_ver（旧版备份在 $_bk）"
   if find_bot_pid >/dev/null; then
-    kill_bot
+    restart_bot_single
     LAUNCHED_MONITOR=1
     setsid /system/bin/sh "$0" monitor "$_bk" "$_old" "$_ver" </dev/null >/dev/null 2>&1 &
     log "已拉起更新看护进程"
@@ -367,7 +424,7 @@ do_monitor() { # <备份目录> <旧bot版本> <新bot版本>
     if [ -f "$_bk/bot.js" ]; then
       cp "$_bk/bot.js" "$ROOTFS/root/qqbot/.bot.js.tmp" && mv "$ROOTFS/root/qqbot/.bot.js.tmp" "$BOT_IN_ROOTFS"
     fi
-    kill_bot
+    restart_bot_single
     echo "bot $_new" >> "$DATA/bad_versions.txt"
     setv bot "$_old"
     write_status rolled_back "$_old" "$_old" "$_cs" "$_cs" "bot v$_new 启动异常，已回滚到 v$_old"

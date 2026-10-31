@@ -1,12 +1,12 @@
 {
   "bot": {"version": 4, "sha256": "bffbe0925158045c657732c437286afb074b3e7b523b371af26aac7f3a66a73e", "path": "files/bot.js"},
-  "scripts": {"version": 3, "files": {
+  "scripts": {"version": 4, "files": {
     "run.sh": {"sha256": "891899fcc271cd80390cc1c1166183db4171b5108308cfa0d4aa9f3e7c237b56", "path": "files/run.sh"},
     "start_qqbot.sh": {"sha256": "b9c7ae8af1aaa7e49bbbdc35e87a17a613556a4a1d44841b1465ef806bdfe3c5", "path": "files/start_qqbot.sh"},
-    "stop_qqbot.sh": {"sha256": "12717eb38db1d31613edb3894fd6252846c7b3f672833010a980bcb66d3fe76d", "path": "files/stop_qqbot.sh"},
+    "stop_qqbot.sh": {"sha256": "0046c6fa6343edcf97d099089233018eed5aaee8353bd15d4fa12c4a14791bec", "path": "files/stop_qqbot.sh"},
     "chroot_run.sh": {"sha256": "6de91cafeb3af20a5b180a43038593f07df7ac7e547418e6c32793a5dfa3c379", "path": "files/chroot_run.sh"},
-    "updater.sh": {"sha256": "0d09eb2fcb6972431be1a30421295bb8c3d1571e9495ed67410ab1971cc9e9b0", "path": "files/updater.sh"}
+    "updater.sh": {"sha256": "2383b70fc4befee138988e0370dfebba703e4165275d6f06add1e7c00b13eaa6", "path": "files/updater.sh"}
   }},
   "min_module_versionCode": 2,
-  "notes": "bot v4: single-instance file lock (bot.lock next to bot.js, QQBOT_LOCK_PATH override) - a second bot.js process now exits immediately instead of double-replying; includes all v3 fixes (message_id dedup, video-over-novel pick). scripts stay v3."
+  "notes": "scripts v4: stop and OTA bot-restart now sweep /proc by exact argv (watchdogs first, TERM then KILL) and kill orphaned bot.js processes that pidfiles/process groups miss; the updater sweeps, then relaunches exactly one watchdog, so bot updates converge to a single instance of the new version. bot stays v4 (single-instance lock + message_id dedup + video-over-novel pick)."
 }
