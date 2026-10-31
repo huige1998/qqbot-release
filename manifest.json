@@ -1,5 +1,5 @@
 {
-  "bot": {"version": 4, "sha256": "bffbe0925158045c657732c437286afb074b3e7b523b371af26aac7f3a66a73e", "path": "files/bot.js"},
+  "bot": {"version": 5, "sha256": "d06ca5a68486062a974cca417b2a834846572eb8cbbd8cc110e8c6a1607ce0e2", "path": "files/bot.js"},
   "scripts": {"version": 4, "files": {
     "run.sh": {"sha256": "891899fcc271cd80390cc1c1166183db4171b5108308cfa0d4aa9f3e7c237b56", "path": "files/run.sh"},
     "start_qqbot.sh": {"sha256": "b9c7ae8af1aaa7e49bbbdc35e87a17a613556a4a1d44841b1465ef806bdfe3c5", "path": "files/start_qqbot.sh"},
@@ -8,5 +8,5 @@
     "updater.sh": {"sha256": "2383b70fc4befee138988e0370dfebba703e4165275d6f06add1e7c00b13eaa6", "path": "files/updater.sh"}
   }},
   "min_module_versionCode": 2,
-  "notes": "scripts v4: stop and OTA bot-restart now sweep /proc by exact argv (watchdogs first, TERM then KILL) and kill orphaned bot.js processes that pidfiles/process groups miss; the updater sweeps, then relaunches exactly one watchdog, so bot updates converge to a single instance of the new version. bot stays v4 (single-instance lock + message_id dedup + video-over-novel pick)."
+  "notes": "bot v5: (1) empty-search retry — when the search API returns an empty result set (backend gateway wobble can yield [] instead of an error; production misfire 2026-10-31 23:24, a search for a title with plenty of results was declared not-found), the bot re-runs the search up to 2 more times at ~6s gaps before replying not-found; a throw still yields the usual service-error reply. (2) daily-digest poster — between 21:00 and 23:59 Asia/Shanghai (fixed +8h math, chroot TZ may be UTC) the bot polls the release mirrors every ~3 min for digest/digest-YYYY-MM-DD.txt (today only), posts its content verbatim as one message to group 873487569, and writes a digest-posted-YYYY-MM-DD marker next to bot.js (re-checked right before sending) so each date is posted at most once; fetch failures stay silent. scripts stays v4: stop and OTA bot-restart sweep /proc by exact argv (watchdogs first, TERM then KILL) and kill orphaned bot.js processes that pidfiles/process groups miss; the updater sweeps, then relaunches exactly one watchdog. bot also keeps v4 behaviors (single-instance lock + message_id dedup + video-over-novel pick)."
 }

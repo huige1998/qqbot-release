@@ -15,6 +15,8 @@ const GROUP_COOLDOWN_MS = 10 * 1000;                       // 同一个群两次
 const POLL_INTERVAL_MS = Number(process.env.QQBOT_POLL_MS || 5000);            // 转存轮询间隔
 const POLL_TIMEOUT_MS = Number(process.env.QQBOT_POLL_TIMEOUT_MS || 120000);   // 转存最长等待
 const SEARCH_TIMEOUT_MS = 90000;                           // 搜索接口偶尔较慢，给足时间
+const EMPTY_RETRY_MAX = 2;                                 // 搜索返回空结果时，最多再重试几次
+const EMPTY_RETRY_GAP_MS = Number(process.env.QQBOT_EMPTY_RETRY_MS || 6000); // 空结果重试的间隔
 const MAX_KEYWORD_LEN = 60;
 const OWNER_ID = '731121979';                              // 主人主号 QQ，只有他能触发云更新
 // 云更新共享目录：手机模块里容器内是 /shared（宿主机 /data/qqbot/shared 的 bind 挂载）；
@@ -236,6 +238,23 @@ async function handleSearch(groupId, keyword) {
     return;
   }
   if (!items.length) {
+    // 后端在网关抖动/半挂时可能直接返回空结果而不是报错（搜索内部有多源
+    // 降级，最坏路径就是空数组）。2026-10-31 23:24 实测：后端短暂塌方期间
+    // 搜《老九门》被误报「没找到」，其实资源一直都在。所以空结果先别下
+    // 结论：隔几秒把搜索重跑两次，都空了才回「没找到」。重试只重跑搜索
+    // 本身，群里不会多发任何消息。
+    for (let retry = 1; retry <= EMPTY_RETRY_MAX && !items.length; retry++) {
+      await new Promise(r => setTimeout(r, EMPTY_RETRY_GAP_MS));
+      try {
+        items = await searchItems(keyword);
+        log(`空结果重试第 ${retry} 次:`, items.length, '条');
+      } catch (e) {
+        log(`空结果重试第 ${retry} 次出错:`, e.message);
+        items = [];
+      }
+    }
+  }
+  if (!items.length) {
     sendGroupMsg(groupId, `没找到《${keyword}》，换个名字或者加上年份再试试。`);
     return;
   }
@@ -315,6 +334,83 @@ async function handleSearch(groupId, keyword) {
     return;
   }
   sendGroupMsg(groupId, `《${title}》还在转存中，稍后打开网页版就能看到链接：\n${BACKEND}`);
+}
+
+/* ---------------- 每日更新日报（21 点自动发群） ----------------
+ * VM 侧每天 21:00 前把当天日报写进发布仓库 digest/digest-YYYY-MM-DD.txt
+ * （内容就是要发的群消息原文：标题行 + 《剧名》更新至X集，不带链接）。
+ * 这里在上海时间 21:00–23:59 之间每 3 分钟去镜像拉一次「今天」的文件，
+ * 拉到就原样发到群里，并落一个 digest-posted-YYYY-MM-DD 标记文件
+ * （在 bot.js 同目录，重启不丢），保证同一天只发一次。拉不到就安静等
+ * 下一轮；昨天的、更旧的文件永远不发。时间一律按上海时间算：手机
+ * chroot 里时区可能是 UTC，所以固定 +8 小时偏移，不依赖进程 TZ。 */
+const DIGEST_GROUP_ID = 873487569;                         // 日报目标群（摸摸）
+const DIGEST_MIRRORS = process.env.QQBOT_DIGEST_BASES
+  ? process.env.QQBOT_DIGEST_BASES.split(',').map(s => s.trim()).filter(Boolean)
+  : [
+      'https://raw.githubusercontent.com/huige1998/qqbot-release/main',
+      'https://cdn.jsdelivr.net/gh/huige1998/qqbot-release@main',
+      'https://ghproxy.net/https://raw.githubusercontent.com/huige1998/qqbot-release/main',
+    ]; // 与 updater.sh 同一套镜像顺序：raw 最新最快，jsdelivr 有缓存，ghproxy 兜底
+const DIGEST_POLL_MS = Number(process.env.QQBOT_DIGEST_POLL_MS || 3 * 60 * 1000);
+const DIGEST_FAKE_NOW_MS = Number(process.env.QQBOT_DIGEST_FAKE_NOW_MS || 0); // 仅测试用：冻结日报时钟
+
+function shanghaiNow() {
+  const ms = (DIGEST_FAKE_NOW_MS > 0 ? DIGEST_FAKE_NOW_MS : Date.now()) + 8 * 3600 * 1000;
+  const t = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return {
+    dateStr: `${t.getUTCFullYear()}-${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())}`,
+    minutes: t.getUTCHours() * 60 + t.getUTCMinutes(),
+  };
+}
+
+function digestMarkerPath(dateStr) { return path.join(__dirname, `digest-posted-${dateStr}`); }
+function digestPosted(dateStr) {
+  try { return fs.existsSync(digestMarkerPath(dateStr)); } catch { return false; }
+}
+function markDigestPosted(dateStr) {
+  try { fs.writeFileSync(digestMarkerPath(dateStr), new Date().toISOString()); }
+  catch (e) { log('写日报发送标记失败:', e.message); }
+}
+
+async function fetchTextFromMirrors(relPath, timeoutMs = 20000) {
+  for (const base of DIGEST_MIRRORS) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${base}/${relPath}`, { signal: ctrl.signal });
+      if (res.ok) return await res.text();
+    } catch { /* 这个镜像不行，换下一个 */ } finally { clearTimeout(timer); }
+  }
+  return null;
+}
+
+let digestBusy = false;
+async function digestTick() {
+  if (digestBusy) return;
+  const { dateStr, minutes } = shanghaiNow();
+  if (minutes < 21 * 60) return;               // 21:00 之前不看；过 0 点日期已翻篇，旧文件自然不会被选中
+  if (digestPosted(dateStr)) return;           // 今天已经发过
+  digestBusy = true;
+  try {
+    const text = await fetchTextFromMirrors(`digest/digest-${dateStr}.txt`);
+    if (!text || !text.trim()) return;         // 文件还没出（或空的），安静等下一轮
+    if (digestPosted(dateStr)) return;         // 发送前再查一次标记，防并发/重启交错导致重复发
+    if (!ws || ws.readyState !== 1) return;    // WS 没连上先别发：标记不落，下轮再试，不会丢
+    sendGroupMsg(DIGEST_GROUP_ID, text);
+    markDigestPosted(dateStr);
+    log(`日报已发送（${dateStr}，${text.length} 字）`);
+  } catch (e) {
+    log('日报轮询出错（忽略，下轮再试）:', e && e.message);
+  } finally {
+    digestBusy = false;
+  }
+}
+
+function startDigestPoster() {
+  setInterval(() => { digestTick().catch(() => {}); }, DIGEST_POLL_MS);
+  digestTick().catch(() => {}); // 启动先跑一次：21 点后重启的机器人能立刻补发，不用等 3 分钟
 }
 
 /* ---------------- 云更新（手机模块专用，宿主机 updater.sh 配合） ----------------
@@ -446,3 +542,4 @@ function connect() {
 
 log('机器人启动，后端地址:', BACKEND);
 connect();
+startDigestPoster();
