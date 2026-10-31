@@ -166,45 +166,82 @@ find_bot_pid() {
 # 各回一条消息。清扫不靠 pid 文件，按 /proc 逐个进程核对命令行精确令牌:
 #   bot 本体: 某个参数正好是 /root/qqbot/bot.js 且 argv[0] 含 node
 #   看门狗:   某个参数正好是 /root/qqbot/start-bot.sh 且 argv[0] 含 sh
-# 令牌按整行精确相等匹配（grep -qx，与更新器 find_bot_pid 同款，已在真机
-# 验证）: 命令行里只是"提到"该路径的排查 shell/grep 等，argv[0] 与令牌
+# 令牌按整行精确相等匹配（与更新器 find_bot_pid 同款，已在真机验证）:
+# 命令行里只是"提到"该路径的排查 shell/grep 等，argv[0] 与令牌
 # 都对不上，不会误杀；脚本自身的 argv 是脚本路径，同样对不上。
-bot_pids_all() {
+# v5 提速: 一轮枚举同时分出 bot 与看门狗（旧版两个函数各扫一遍 /proc、
+# 每进程 fork 两三条管道，真机一轮要好几秒）；匹配改在 shell 内做字符串
+# 比较，只有命中令牌的少数进程才多取一次 argv[0]。最多两轮，每轮先 TERM
+# 全部目标、等 1 秒再 KILL 残留（防看门狗在窗口里又拉起一个 bot，下一轮
+# 或本轮 KILL 段收尾）。结束时把仍残留的 bot pid 打到 stdout（正常应
+# 为空），调用方据此记日志/告警。
+# QQBOT_SWEEP_GUARD（可选，进程启动节拍）: 晚于该节拍启动的进程跳过。
+# stop_qqbot.sh 在 --inline 时把它设为自身启动节拍——WebUI「重启」是
+# 先停后起，新拉起的看门狗/bot 不能被还在跑的上一轮清扫误杀；
+# 更新器不设此变量，行为与旧版一致（见到的目标全杀）。
+_QQBOT_NL='
+'
+_qqbot_starttime() { # <pid>: 输出进程启动节拍（stat 第 22 字段），读不到输出 0
+  _s=$(cat "/proc/$1/stat" 2>/dev/null) || { echo 0; return; }
+  _s=${_s##*')'}
+  set -- $_s
+  if [ $# -ge 20 ]; then echo "${20}"; else echo 0; fi
+}
+qqbot_pids_all() {
+  # 一轮 /proc 枚举，逐行输出命中的 "b:<pid>"（bot）/ "w:<pid>"（看门狗）
   for _d in /proc/[0-9]*; do
     [ -r "$_d/cmdline" ] || continue
-    if tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | grep -qx '/root/qqbot/bot.js'; then
-      _exe=$(tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | head -n 1)
-      case "$_exe" in *node*) echo "${_d#/proc/}" ;; esac
+    _cmd=$(tr '\0' '\n' < "$_d/cmdline" 2>/dev/null)
+    [ -n "$_cmd" ] || continue
+    _tagged="$_QQBOT_NL$_cmd$_QQBOT_NL"
+    _hit=""
+    case "$_tagged" in *"$_QQBOT_NL/root/qqbot/bot.js$_QQBOT_NL"*) _hit=b ;; esac
+    case "$_tagged" in *"$_QQBOT_NL/root/qqbot/start-bot.sh$_QQBOT_NL"*) _hit="${_hit}w" ;; esac
+    [ -n "$_hit" ] || continue
+    _pid=${_d#/proc/}
+    if [ -n "$QQBOT_SWEEP_GUARD" ] && [ "$QQBOT_SWEEP_GUARD" != "0" ]; then
+      _st=$(_qqbot_starttime "$_pid")
+      [ "$_st" -gt "$QQBOT_SWEEP_GUARD" ] && continue
     fi
+    _a0=$(printf '%s' "$_cmd" | head -n 1)
+    case "$_hit" in
+      *b*) case "$_a0" in *node*) echo "b:$_pid" ;; esac ;;
+    esac
+    case "$_hit" in
+      *w*) case "$_a0" in *sh*) echo "w:$_pid" ;; esac ;;
+    esac
   done
 }
-watchdog_pids_all() {
-  for _d in /proc/[0-9]*; do
-    [ -r "$_d/cmdline" ] || continue
-    if tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | grep -qx '/root/qqbot/start-bot.sh'; then
-      _exe=$(tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | head -n 1)
-      case "$_exe" in *sh*) echo "${_d#/proc/}" ;; esac
-    fi
+_qqbot_scan() { # 把一轮枚举结果收进 _SCAN_B / _SCAN_W（空格分隔的 pid 串）
+  _SCAN_B=""; _SCAN_W=""
+  for _t in $(qqbot_pids_all); do
+    case "$_t" in
+      b:*) _SCAN_B="$_SCAN_B ${_t#b:}" ;;
+      w:*) _SCAN_W="$_SCAN_W ${_t#w:}" ;;
+    esac
   done
+  _SCAN_B=${_SCAN_B# }
+  _SCAN_W=${_SCAN_W# }
 }
-# 先 TERM 重生者（看门狗）再 TERM 全部 bot，等 2 秒后 KILL 残留，之后再
-# 复查一轮（防看门狗在被 KILL 前的窗口里又拉起一个 bot）。结束时把仍
-# 残留的 bot pid 打到 stdout（正常应为空），调用方据此记日志/告警。
 sweep_bot_processes() {
-  _w=$(watchdog_pids_all); [ -n "$_w" ] && kill $_w 2>/dev/null
-  _b=$(bot_pids_all);      [ -n "$_b" ] && kill $_b 2>/dev/null
-  sleep 2
-  _w=$(watchdog_pids_all); [ -n "$_w" ] && kill -KILL $_w 2>/dev/null
-  _b=$(bot_pids_all);      [ -n "$_b" ] && kill -KILL $_b 2>/dev/null
-  sleep 1
-  _b=$(bot_pids_all)
-  if [ -n "$_b" ]; then
-    _w=$(watchdog_pids_all); [ -n "$_w" ] && kill -KILL $_w 2>/dev/null
-    kill -KILL $_b 2>/dev/null
+  _round=1
+  while [ "$_round" -le 2 ]; do
+    _qqbot_scan
+    if [ -z "$_SCAN_B" ] && [ -z "$_SCAN_W" ]; then
+      echo ""
+      return 0
+    fi
+    # 先 TERM 重生者（看门狗）再 TERM 全部 bot，等 1 秒后 KILL 残留
+    [ -n "$_SCAN_W" ] && kill $_SCAN_W 2>/dev/null
+    [ -n "$_SCAN_B" ] && kill $_SCAN_B 2>/dev/null
     sleep 1
-    _b=$(bot_pids_all)
-  fi
-  echo "$_b"
+    _qqbot_scan
+    [ -n "$_SCAN_W" ] && kill -KILL $_SCAN_W 2>/dev/null
+    [ -n "$_SCAN_B" ] && kill -KILL $_SCAN_B 2>/dev/null
+    _round=$((_round + 1))
+  done
+  _qqbot_scan
+  echo "$_SCAN_B"
 }
 # ===== 进程清扫结束 =====
 
