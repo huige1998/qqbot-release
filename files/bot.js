@@ -77,11 +77,71 @@ async function getTask(id) {
 const itemTitle = (item, fallback) => (item && (item.title || item.name)) || fallback;
 const itemShare = (item) => item && (item.my_share || item.share_url || '');
 
+/* 选片打分：群友搜的基本是影视剧，但结果里常混同名小说/电子书，按顺序拿
+ * 第一条会转错（实例：搜《老九门》转成了小说番外合集）。带集数/清晰度/
+ * 影视标记的加分，带小说/电子书标记的重扣分，片名完整包含查询词也加分；
+ * 同分保持后端给的顺序（后端已按时间倒序，新的在前）。 */
+function isNovelName(name) {
+  return /小说|电子书|精校|全本|有声/.test(name) || /txt/i.test(name) || /作者\s*[:：]/.test(name);
+}
+
+function isNovelItem(item) {
+  return isNovelName(itemTitle(item, ''));
+}
+
+function scoreItem(item, keyword) {
+  const name = itemTitle(item, '');
+  if (!name) return 0;
+  let s = 0;
+  if (keyword && name.includes(keyword)) s += 3;                    // 片名完整包含查询词
+  if (/更新至|全\s*\d+\s*集|第\s*\d+\s*集/.test(name)) s += 3;       // 集数标记（影视剧典型）
+  if (/S\d{1,2}E\d{1,3}/i.test(name)) s += 3;                       // S01E01 这类标记
+  if (/4K|2160|1080/.test(name)) s += 2;                            // 清晰度标记
+  if (/电视剧|电影|剧集/.test(name)) s += 2;
+  if (name.includes('集')) s += 1;                                  // 弱信号（“合集”也会命中，只给 1 分）
+  if (isNovelName(name)) s -= 6;                                    // 小说/电子书/有声书标记，重扣
+  return s;
+}
+
+// 在候选池里挑分数最高的；同分保持原顺序（严格大于才替换）
+function pickBest(pool, keyword) {
+  let best = null, bestScore = -Infinity;
+  for (const it of pool) {
+    const sc = scoreItem(it, keyword);
+    if (sc > bestScore) { best = it; bestScore = sc; }
+  }
+  return { item: best, score: bestScore };
+}
+
 /* ---------------- OneBot 连接 ---------------- */
 
 let ws = null;
 let echoSeq = 0;
+let connGen = 0;            // 连接代数：每次 connect 自增，旧连接的迟到事件一律作废
+let reconnectTimer = null;  // 保证同一时刻最多挂着一个重连定时器
 const lastSearchAt = new Map(); // group_id -> timestamp
+
+/* 消息去重：OneBot/NapCat 偶尔会把同一条消息事件重复投递（断线重连补发、
+ * 新旧双连接各推一份等）。按 message_id 记住最近处理过的消息，重复投递
+ * 直接丢弃，保证一条群消息最多触发一次流程、「正在找」最多发一次。
+ * （原有的 10 秒群冷却只能挡住紧挨着的重复，挡不住隔一会儿的重投递，
+ * 也管不到「帮助」「更新」这两条没有冷却的分支。） */
+const SEEN_MSG_MAX = 200;                  // 最多记住最近 200 条 message_id
+const SEEN_MSG_TTL_MS = 10 * 60 * 1000;    // 超过 10 分钟的记录视为过期，可再处理
+const seenMsgAt = new Map();               // message_id(String) -> 首次处理时间戳
+
+function seenMessage(id) {
+  if (id == null || id === '') return false;
+  const key = String(id);
+  const now = Date.now();
+  const prev = seenMsgAt.get(key);
+  if (prev != null && now - prev < SEEN_MSG_TTL_MS) return true;
+  seenMsgAt.set(key, now);
+  while (seenMsgAt.size > SEEN_MSG_MAX) {
+    seenMsgAt.delete(seenMsgAt.keys().next().value); // Map 按插入顺序迭代，先丢最旧的
+  }
+  return false;
+}
 
 function sendGroupMsg(groupId, text) {
   if (!ws || ws.readyState !== 1) { log('WS 未连接，丢弃一条待发消息:', text); return; }
@@ -117,18 +177,35 @@ async function handleSearch(groupId, keyword) {
     sendGroupMsg(groupId, `没找到《${keyword}》，换个名字或者加上年份再试试。`);
     return;
   }
-  // 已经转存过的：直接回现成链接
-  const ready = items.find(i => itemShare(i));
-  if (ready) {
-    sendGroupMsg(groupId, `《${itemTitle(ready, keyword)}》\n${itemShare(ready)}`);
+  // 可提交转存的候选：优先夸克（后端目前只有夸克能真正转存成功）
+  const withRef = items.filter(i => i && i.ref);
+  const quarkPool = withRef.filter(i => i.drive === 'quark');
+  const pool = quarkPool.length ? quarkPool : withRef;
+  const fresh = pickBest(pool, keyword);
+
+  // 已经转存过的：有现成链接、不是小说版、且分数不输最佳新候选 → 直接回现成链接
+  const ready = pickBest(items.filter(i => itemShare(i) && !isNovelItem(i)), keyword);
+  if (ready.item && (!fresh.item || ready.score >= fresh.score)) {
+    sendGroupMsg(groupId, `《${itemTitle(ready.item, keyword)}》\n${itemShare(ready.item)}`);
     return;
   }
-  // 提交转存：优先夸克（后端目前只有夸克能真正转存成功），否则用第一条
-  const cand = items.find(i => i && i.ref && i.drive === 'quark') || items.find(i => i && i.ref) || items[0];
-  if (!cand || !cand.ref) {
+
+  if (!fresh.item) {
+    // 没有可转存的候选：只剩已转存过的小说版时，把现成链接给出来（库里已有，不算新转）
+    const anyReady = items.find(i => itemShare(i));
+    if (anyReady) {
+      sendGroupMsg(groupId, `《${itemTitle(anyReady, keyword)}》\n${itemShare(anyReady)}`);
+      return;
+    }
     sendGroupMsg(groupId, `没找到《${keyword}》可用的资源，换个名字再试试。`);
     return;
   }
+  // 候选清一色是小说版：小说以后再搞，这次不转，群里说明白
+  if (pool.every(i => isNovelItem(i))) {
+    sendGroupMsg(groupId, `《${keyword}》只找到小说版，影视版暂时没有，小说以后再说。`);
+    return;
+  }
+  const cand = fresh.item;
   const title = itemTitle(cand, keyword);
   let created;
   try {
@@ -248,6 +325,7 @@ async function handleUpdate(groupId) {
 function onEvent(ev) {
   if (!ev || ev.post_type !== 'message' || ev.message_type !== 'group') return;
   if (ev.user_id != null && ev.self_id != null && String(ev.user_id) === String(ev.self_id)) return; // 忽略自己发的
+  if (seenMessage(ev.message_id)) { log('忽略重复投递的消息事件，message_id =', ev.message_id); return; }
   const groupId = ev.group_id;
   const text = messageText(ev);
   if (!text) return;
@@ -274,14 +352,34 @@ function onEvent(ev) {
 }
 
 function connect() {
+  const gen = ++connGen;
+  // 先关掉上一条连接再建新的：旧连接可能还半开着，新旧两条同时在线时
+  // NapCat 会给每条连接各推一份事件，同一条消息就会被处理两遍。
+  if (ws) {
+    try { ws.close(); } catch { /* 忽略 */ }
+    ws = null;
+  }
   log('正在连接 NapCat:', WS_URL);
-  ws = new WebSocket(WS_URL);
-  ws.addEventListener('open', () => log('已连上 NapCat，机器人上线。等群里发「搜 片名」即可。'));
-  ws.addEventListener('message', (e) => {
+  const sock = new WebSocket(WS_URL);
+  ws = sock;
+  sock.addEventListener('open', () => {
+    if (gen !== connGen) { try { sock.close(); } catch { /* 忽略 */ } return; }
+    log('已连上 NapCat，机器人上线。等群里发「搜 片名」即可。');
+  });
+  sock.addEventListener('message', (e) => {
+    if (gen !== connGen || ws !== sock) return; // 只认当前这条连接，旧连接的事件不算数
     try { onEvent(JSON.parse(typeof e.data === 'string' ? e.data : '')); } catch { /* 非 JSON 数据忽略 */ }
   });
-  ws.addEventListener('close', () => { log('连接断开，5 秒后重连…'); setTimeout(connect, 5000); });
-  ws.addEventListener('error', () => { try { ws.close(); } catch { /* 忽略 */ } });
+  sock.addEventListener('close', () => {
+    if (gen !== connGen) return; // 旧连接的关闭不触发重连，新连接已经接管
+    if (ws === sock) ws = null;
+    if (reconnectTimer == null) { // 最多只挂一个重连定时器，避免攒出多条连接
+      log('连接断开，5 秒后重连…');
+      reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 5000);
+    }
+  });
+  // 出错时关自己这条连接（旧代码关的是全局 ws，重连后会误关新连接、留着旧连接继续收事件）
+  sock.addEventListener('error', () => { try { sock.close(); } catch { /* 忽略 */ } });
 }
 
 log('机器人启动，后端地址:', BACKEND);

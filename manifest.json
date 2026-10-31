@@ -1,5 +1,5 @@
 {
-  "bot": {"version": 2, "sha256": "ce34aafb52ff537c64eb1018b912a4dd974e2ecf1126fd8579ec5b2dc01d369e", "path": "files/bot.js"},
+  "bot": {"version": 3, "sha256": "26b5f36ee7117d26523fe05a2f3e7b9a2a21caee5116cde6b6d2ca1fcc01b599", "path": "files/bot.js"},
   "scripts": {"version": 3, "files": {
     "run.sh": {"sha256": "891899fcc271cd80390cc1c1166183db4171b5108308cfa0d4aa9f3e7c237b56", "path": "files/run.sh"},
     "start_qqbot.sh": {"sha256": "b9c7ae8af1aaa7e49bbbdc35e87a17a613556a4a1d44841b1465ef806bdfe3c5", "path": "files/start_qqbot.sh"},
@@ -8,5 +8,5 @@
     "updater.sh": {"sha256": "0d09eb2fcb6972431be1a30421295bb8c3d1571e9495ed67410ab1971cc9e9b0", "path": "files/updater.sh"}
   }},
   "min_module_versionCode": 2,
-  "notes": "scripts v3 (with module v1.2): pid-reuse-proof alive() checks in start_qqbot.sh/run.sh. bot stays v2."
+  "notes": "bot v3: message_id dedup + single-connection dispatch (no duplicate replies); pick video results over novels, novel-only searches are not transferred. scripts stay v3."
 }
