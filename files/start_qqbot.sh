@@ -36,6 +36,29 @@ fi
 [ -f "$DATA/.installed" ] || { echo "环境未安装完成，等 install_env"; exit 0; }
 [ -x "$ROOTFS/opt/QQ/qq" ] || { echo "rootfs 不完整，退出"; exit 1; }
 
+# ---- OneBot 配置预置（机器人换号） ------------------------------------
+# NapCat 按账号读配置 onebot11_<QQ号>.json；install_env 当初只种了老号
+# 3322592972 的专属配置。老号被 QQ 风控后机器人换到新号，新号没有专属
+# 配置时可能起不来 WS(:3001)。这里在起 NapCat 前把基础配置补种给名单
+# 里的账号：已存在绝不覆盖，基础配置缺失只记日志继续、绝不挡启动。
+# 以后再换号，往 QQ_BOT_ACCOUNTS 里加号即可。
+QQ_BOT_ACCOUNTS="411649762"
+CFGDIR="$ROOTFS/root/NapCat.linux.arm64/config"
+for acct in $QQ_BOT_ACCOUNTS; do
+  if [ ! -f "$CFGDIR/onebot11_$acct.json" ]; then
+    if [ -f "$CFGDIR/onebot11.json" ]; then
+      mkdir -p "$CFGDIR" 2>/dev/null
+      if cp "$CFGDIR/onebot11.json" "$CFGDIR/onebot11_$acct.json" 2>/dev/null; then
+        echo "已为账号 $acct 预置 OneBot 配置"
+      else
+        echo "警告: 为账号 $acct 预置 OneBot 配置失败，继续启动"
+      fi
+    else
+      echo "警告: 基础 OneBot 配置不存在，跳过账号 $acct 的配置预置"
+    fi
+  fi
+done
+
 # ---- 挂载（已挂的跳过） ----------------------------------------------
 ismounted() { grep -q " $1 " /proc/mounts 2>/dev/null; }
 domount() { # domount <类型/源> <目标> [bind]
