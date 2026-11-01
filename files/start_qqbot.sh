@@ -36,26 +36,45 @@ fi
 [ -f "$DATA/.installed" ] || { echo "环境未安装完成，等 install_env"; exit 0; }
 [ -x "$ROOTFS/opt/QQ/qq" ] || { echo "rootfs 不完整，退出"; exit 1; }
 
-# ---- OneBot 配置预置（机器人换号） ------------------------------------
+# ---- OneBot 配置预置/自愈对齐（机器人换号） --------------------------
 # NapCat 按账号读配置 onebot11_<QQ号>.json；install_env 当初只种了老号
-# 3322592972 的专属配置。老号被 QQ 风控后机器人换到新号，新号没有专属
-# 配置时可能起不来 WS(:3001)。这里在起 NapCat 前把基础配置补种给名单
-# 里的账号：已存在绝不覆盖，基础配置缺失只记日志继续、绝不挡启动。
-# 以后再换号，往 QQ_BOT_ACCOUNTS 里加号即可。
+# 3322592972 的专属配置。新号 411649762 首次登录早于 v6 的补种逻辑，
+# NapCat 自行生成了一份默认配置，WS(:3001) 是关的，而 v6 的补种
+# “已存在绝不覆盖”又保住了那份坏配置，bot 永远连不上 NapCat。
+# 这里改成自愈：缺失→补种基础配置；已存在→做 WS 健康检查（ws.enable
+# =true 且 port=3001，两条都过才算健康），健康就原样不动（尊重账号
+# 自己的合法差异）；不健康（或读不出）→先备份为 .bak 再用基础配置
+# 对齐。基础配置缺失只记日志继续，整段任何失败都不挡启动。以后再
+# 换号，往 QQ_BOT_ACCOUNTS 里加号即可。
 QQ_BOT_ACCOUNTS="411649762"
 CFGDIR="$ROOTFS/root/NapCat.linux.arm64/config"
+WS_OK_RE='"ws"[[:space:]]*:[[:space:]]*\{[[:space:]]*"enable"[[:space:]]*:[[:space:]]*true'
+PORT_OK_RE='"port"[[:space:]]*:[[:space:]]*3001'
 for acct in $QQ_BOT_ACCOUNTS; do
-  if [ ! -f "$CFGDIR/onebot11_$acct.json" ]; then
-    if [ -f "$CFGDIR/onebot11.json" ]; then
-      mkdir -p "$CFGDIR" 2>/dev/null
-      if cp "$CFGDIR/onebot11.json" "$CFGDIR/onebot11_$acct.json" 2>/dev/null; then
-        echo "已为账号 $acct 预置 OneBot 配置"
-      else
-        echo "警告: 为账号 $acct 预置 OneBot 配置失败，继续启动"
-      fi
+  acct_cfg="$CFGDIR/onebot11_$acct.json"
+  base_cfg="$CFGDIR/onebot11.json"
+  if [ ! -f "$base_cfg" ]; then
+    echo "警告: 基础 OneBot 配置不存在，跳过账号 $acct 的配置预置"
+    continue
+  fi
+  if [ ! -f "$acct_cfg" ]; then
+    mkdir -p "$CFGDIR" 2>/dev/null
+    if cp "$base_cfg" "$acct_cfg" 2>/dev/null; then
+      echo "已为账号 $acct 预置 OneBot 配置"
     else
-      echo "警告: 基础 OneBot 配置不存在，跳过账号 $acct 的配置预置"
+      echo "警告: 为账号 $acct 预置 OneBot 配置失败，继续启动"
     fi
+    continue
+  fi
+  # 已存在: WS 健康检查（健康→原样不动；不健康→备份后对齐）
+  if grep -Eq "$WS_OK_RE" "$acct_cfg" 2>/dev/null && grep -Eq "$PORT_OK_RE" "$acct_cfg" 2>/dev/null; then
+    continue
+  fi
+  cp "$acct_cfg" "$acct_cfg.bak" 2>/dev/null
+  if cp "$base_cfg" "$acct_cfg" 2>/dev/null; then
+    echo "已对齐账号 $acct 的 OneBot 配置（WS 通道未开启，原配置备份为 onebot11_$acct.json.bak）"
+  else
+    echo "警告: 为账号 $acct 对齐 OneBot 配置失败，继续启动"
   fi
 done
 
