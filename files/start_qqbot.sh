@@ -78,6 +78,46 @@ for acct in $QQ_BOT_ACCOUNTS; do
   fi
 done
 
+# ---- 快速登录账号对齐（起栈前修正写死的 -q 账号） --------------------
+# 容器内启动器 start-napcat.sh 是 install_env 安装时生成的，拉起行
+# `exec ./napcat.sh -q <号>` 里的号被写死成老号 3322592972。换号后
+# 每次起栈 NapCat 都先拿老号试快速登录：老号没有有效登录态（且已被
+# QQ 风控），必然失败并回落扫码，于是“每次重启都要扫码”；老号当年
+# 能快速登录，正是因为 -q 与登录态是同一个号。这里在起 NapCat 之前
+# 把启动器里的 -q 对齐到当前机器人账号（QQ_BOT_ACCOUNTS 的第一个）：
+# 已是当前号→不动；仍是老号→先把原启动器备份为 start-napcat.sh.bak
+# （只备一次，不覆盖旧备份），再经临时文件 + mv 原子替换，只换 -q
+# 后面的老号、其余字节不动；启动器缺失或没有 -q 老号字样→记一行
+# 跳过。任何失败只记日志，不挡启动。
+BOT_ACCOUNT=$(echo $QQ_BOT_ACCOUNTS | cut -d' ' -f1)
+STALE_QQ=3322592972
+NAPCAT_SH="$ROOTFS/root/qqbot/start-napcat.sh"
+if [ -n "$BOT_ACCOUNT" ] && [ "$BOT_ACCOUNT" != "$STALE_QQ" ]; then
+  if [ -f "$NAPCAT_SH" ]; then
+    if grep -q -e "-q $BOT_ACCOUNT" "$NAPCAT_SH" 2>/dev/null; then
+      : # 已对齐，不动
+    elif grep -q -e "-q $STALE_QQ" "$NAPCAT_SH" 2>/dev/null; then
+      [ -f "$NAPCAT_SH.bak" ] || cp "$NAPCAT_SH" "$NAPCAT_SH.bak" 2>/dev/null
+      if sed "s/-q $STALE_QQ/-q $BOT_ACCOUNT/" "$NAPCAT_SH" > "$NAPCAT_SH.tmp" 2>/dev/null && [ -s "$NAPCAT_SH.tmp" ]; then
+        chmod 755 "$NAPCAT_SH.tmp" 2>/dev/null
+        if mv "$NAPCAT_SH.tmp" "$NAPCAT_SH" 2>/dev/null; then
+          echo "已把快速登录账号对齐为 $BOT_ACCOUNT"
+        else
+          rm -f "$NAPCAT_SH.tmp" 2>/dev/null
+          echo "警告: 快速登录账号对齐失败（替换启动器失败），继续启动"
+        fi
+      else
+        rm -f "$NAPCAT_SH.tmp" 2>/dev/null
+        echo "警告: 快速登录账号对齐失败（生成新启动器失败），继续启动"
+      fi
+    else
+      echo "提示: 启动器里没有 -q $STALE_QQ，跳过快速登录账号对齐"
+    fi
+  else
+    echo "提示: 容器启动器不存在，跳过快速登录账号对齐"
+  fi
+fi
+
 # ---- 挂载（已挂的跳过） ----------------------------------------------
 ismounted() { grep -q " $1 " /proc/mounts 2>/dev/null; }
 domount() { # domount <类型/源> <目标> [bind]
