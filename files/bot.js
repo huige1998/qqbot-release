@@ -9,7 +9,8 @@ const path = require('path');
  *       （NapCat 一键包里自带的 node.exe 就是 22 版，直接用它运行本文件。）
  */
 
-const BACKEND = (process.env.PAN_BACKEND || 'https://pan-search-5160265-1520428323.ap-shanghai.run.tcloudbase.com').replace(/\/+$/, '');
+const BACKEND_CLOUD = (process.env.PAN_BACKEND || 'https://pan-search-5160265-1520428323.ap-shanghai.run.tcloudbase.com').replace(/\/+$/, '');
+const BACKEND_LOCAL = (process.env.PAN_BACKEND_LOCAL || 'http://127.0.0.1:8787').replace(/\/+$/, '');
 const WS_URL = process.env.QQBOT_WS_URL || 'ws://127.0.0.1:3001';
 const GROUP_COOLDOWN_MS = 10 * 1000;                       // 同一个群两次搜索的最小间隔
 const POLL_INTERVAL_MS = Number(process.env.QQBOT_POLL_MS || 5000);            // 转存轮询间隔
@@ -18,6 +19,7 @@ const SEARCH_TIMEOUT_MS = 90000;                           // 搜索接口偶尔
 const EMPTY_RETRY_MAX = 2;                                 // 搜索返回空结果时，最多再重试几次
 const EMPTY_RETRY_GAP_MS = Number(process.env.QQBOT_EMPTY_RETRY_MS || 6000); // 空结果重试的间隔
 const MAX_CANDIDATE_TRIES = 3;                             // 候选源失效/无链接时，最多顺延试几个候选
+const MAX_FLOW_RESTARTS = 1;                               // 本地后端中途断开时，整轮换后端重搜的最多次数
 const MAX_KEYWORD_LEN = 60;
 const OWNER_ID = '731121979';                              // 主人主号 QQ，只有他能触发云更新
 // 云更新共享目录：手机模块里容器内是 /shared（宿主机 /data/qqbot/shared 的 bind 挂载）；
@@ -154,7 +156,66 @@ process.on('SIGINT', () => { releaseInstanceLock(); process.exit(0); });
 
 acquireInstanceLock();
 
-/* ---------------- 云端后端调用 ---------------- */
+/* ---------------- 后端调用（v8：本地优先、云端兜底） ----------------
+ * 2026-11-01 后端搬进手机：同一个 chroot 里跑着一份本地后端
+ * （127.0.0.1:8787），云端 CloudBase 只作兜底。路由规则（设计 §5）：
+ * - 每条「搜」流程开始先探本地 /api/health（2 秒）：通 → 整条流程都用
+ *   本地；不通 → 整条流程用云端，并熔断 60 秒（期间不再探测、直走云端）。
+ * - 会话亲和：ref 令牌是后端实例私有的，本地搜出的 ref 只能提交给本地。
+ *   所以一条流程定下 base 后 search/submit/poll 全程不换：本地在中途网络
+ *   断开时，搜索这一步可以当场改走云端（还没产生 ref），但提交/轮询带着
+ *   本地 ref 绝不跨后端提交（必 400）——该候选判 'netfail'，整轮作废、
+ *   重新定 base 重搜（新后端发新 ref）。
+ * - HTTP 业务错误（如 400 ref 无效）不是网络故障，永不触发切换；搜索
+ *   本身慢也不触发（沿用 SEARCH_TIMEOUT，慢不等于后端死了）。
+ * chroot 是 env -i，环境变量基本传不进来：默认值写死，env 只作调试覆盖。 */
+const LOCAL_BREAKER_MS = 60 * 1000;  // 本地后端熔断时长，期内直走云端
+const PROBE_TIMEOUT_MS = 2000;       // 本地健康探测超时
+let localDownUntil = 0;              // 熔断截止时间戳，在此之前不探测本地
+let localWasDown = false;            // 正处于「本地不可用」期，恢复时打一行日志
+
+// fetch 抛出的错误里，哪些算「网络级故障」（连不上/断开/超时），哪些不算。
+// HTTP 状态码错误不会走到这里（fetchJson 对任何状态码都解析 body、不抛错），
+// 所以业务错误天然不触发切换，这里只判传输层。
+function isNetworkError(e) {
+  if (!e) return false;
+  if (e.name === 'AbortError' || e.name === 'TimeoutError') return true; // 本地探测/请求超时掐断
+  const code = (e.cause && e.cause.code) || e.code || '';
+  if (code && ['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'ESOCKETTIMEDOUT',
+    'ENOTFOUND', 'EAI_AGAIN', 'EPIPE', 'ENETUNREACH', 'EHOSTUNREACH',
+    'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET',
+  ].includes(code)) return true;
+  return e instanceof TypeError; // undici 的网络失败是 TypeError("fetch failed")，具体 code 在 cause 里，兜底认它
+}
+
+function markLocalDown() {
+  if (Date.now() >= localDownUntil) log('本地后端不可用，本次走云端');
+  localDownUntil = Date.now() + LOCAL_BREAKER_MS;
+  localWasDown = true;
+}
+
+async function probeLocal() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${BACKEND_LOCAL}/api/health`, { signal: ctrl.signal });
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => null);
+    return !!(data && data.ok === true);
+  } catch { return false; }
+  finally { clearTimeout(timer); }
+}
+
+// 给一条流程定 base：熔断期内直走云端；否则探本地，通→本地，不通→云端+熔断。
+async function pickBase() {
+  if (Date.now() < localDownUntil) return BACKEND_CLOUD;
+  if (await probeLocal()) {
+    if (localWasDown) { localWasDown = false; log('本地后端已恢复，恢复本地优先'); }
+    return BACKEND_LOCAL;
+  }
+  markLocalDown();
+  return BACKEND_CLOUD;
+}
 
 async function fetchJson(url, options = {}, timeoutMs = 30000) {
   const ctrl = new AbortController();
@@ -168,33 +229,41 @@ async function fetchJson(url, options = {}, timeoutMs = 30000) {
   }
 }
 
-async function searchItems(keyword) {
+/* 在 base 上搜。返回 { items, base }：base 一般就是传入的 base，但本地在
+ * 搜索这一步网络断开时，会当场改走云端重试（搜索不带 ref 绑定，可以换），
+ * 这时返回的 base 已是云端，调用方必须用返回的 base 继续提交/轮询，
+ * 否则 ref 会串台。三次都失败才抛错（与 v7 同语义）。 */
+async function searchItems(base, keyword) {
   let lastErr;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const data = await fetchJson(`${BACKEND}/api/search?q=${encodeURIComponent(keyword)}`, {}, SEARCH_TIMEOUT_MS);
-      if (Array.isArray(data)) return data;
-      return data.items || data.results || [];
+      const data = await fetchJson(`${base}/api/search?q=${encodeURIComponent(keyword)}`, {}, SEARCH_TIMEOUT_MS);
+      const items = Array.isArray(data) ? data : (data.items || data.results || []);
+      return { items, base };
     } catch (e) {
       lastErr = e;
       const cause = (e && e.cause && (e.cause.code || e.cause.message)) || '';
       log(`搜索第 ${attempt} 次尝试失败:`, e.message, cause);
+      if (base === BACKEND_LOCAL && isNetworkError(e)) {
+        markLocalDown();
+        base = BACKEND_CLOUD; // 后续尝试改走云端，结果里的 ref 也随之是云端的
+      }
       if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 4000));
     }
   }
   throw lastErr;
 }
 
-async function submitTask(ref) {
-  return fetchJson(`${BACKEND}/api/tasks`, {
+async function submitTask(base, ref) {
+  return fetchJson(`${base}/api/tasks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ref, requester: 'qq-bot' }),
   }, 30000);
 }
 
-async function getTask(id) {
-  const data = await fetchJson(`${BACKEND}/api/tasks/${encodeURIComponent(id)}`, {}, 15000);
+async function getTask(base, id) {
+  const data = await fetchJson(`${base}/api/tasks/${encodeURIComponent(id)}`, {}, 15000);
   return (data && data.task) || data || {};
 }
 
@@ -292,13 +361,19 @@ function messageText(ev) {
  * 转存失败、转完没生成链接、或轮询超时，一律返回 'fail'，由调用方静默
  * 换下一个候选——群里不发任何消息，免得像 2026-11-01 00:50 那次一样，
  * 第一个候选的源被原主取消（夸克 41012）就误报「已转存好但没生成新链接」。
- * 返回 'filtered' 表示内容被过滤（对这个关键词整体的判定，调用方收尾）。 */
-async function tryCandidate(groupId, cand, keyword) {
+ * 返回 'filtered' 表示内容被过滤（对这个关键词整体的判定，调用方收尾）。
+ * 返回 'netfail' 表示本地后端在提交/轮询中途网络断开：候选的 ref 是本地
+ * 发的，绝不能拿去云端提交，整轮作废，由调用方重新定 base 重搜。 */
+async function tryCandidate(groupId, base, cand, keyword) {
   const title = itemTitle(cand, keyword);
   let created;
   try {
-    created = await submitTask(cand.ref);
+    created = await submitTask(base, cand.ref);
   } catch (e) {
+    if (base === BACKEND_LOCAL && isNetworkError(e)) {
+      log('提交时本地后端断开（整轮作罢，换后端重搜）:', title);
+      return 'netfail';
+    }
     log('提交转存出错（该候选作罢）:', e.message);
     return 'fail';
   }
@@ -322,7 +397,13 @@ async function tryCandidate(groupId, cand, keyword) {
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
     let t;
-    try { t = await getTask(task.id); } catch { continue; }
+    try { t = await getTask(base, task.id); } catch (e) {
+      if (base === BACKEND_LOCAL && isNetworkError(e)) {
+        log('轮询时本地后端断开（整轮作罢，换后端重搜）:', title);
+        return 'netfail';
+      }
+      continue;
+    }
     if (t.status === 'done' && t.share_url) {
       sendGroupMsg(groupId, `《${title}》转存好了\n${t.share_url}`);
       return 'ok';
@@ -344,13 +425,34 @@ async function tryCandidate(groupId, cand, keyword) {
 
 async function handleSearch(groupId, keyword) {
   sendGroupMsg(groupId, `正在找《${keyword}》，找到后会自动转存，好了就把链接发到群里。`);
+  // 一轮 = 定 base → 搜索 → 挑候选 → 挨个试（searchRound）。轮内的普通失败
+  // （源失效、没链接等）不重搜，与 v7 一致；只有本地后端在一轮中途网络
+  // 断开（'netfail'）才整轮作废、重新定 base 重搜，最多重搜
+  // MAX_FLOW_RESTARTS 轮，防止后端反复横跳时无限重搜。
+  for (let restart = 0; ; restart++) {
+    const needRestart = await searchRound(groupId, keyword);
+    if (!needRestart) return;
+    if (restart >= MAX_FLOW_RESTARTS) {
+      sendGroupMsg(groupId, `《${keyword}》找到的几个源都不行，有的链接已经失效了，换个名字或者晚点再试试。`);
+      return;
+    }
+  }
+}
+
+/* 一轮完整的搜索流程：定下 base 后全程不换（会话亲和，见后端调用节的
+ * v8 说明）。返回 true 只表示「本地后端中途断开、整轮作废」，由
+ * handleSearch 重新定 base 重搜；其余一切结局（出链接、没找到、来源
+ * 都不行、被过滤、搜索接口彻底出错）都在本轮内回完消息并返回 false。 */
+async function searchRound(groupId, keyword) {
+  let base = await pickBase();
   let items;
   try {
-    items = await searchItems(keyword);
+    const r = await searchItems(base, keyword);
+    items = r.items; base = r.base; // 搜索途中可能已改走云端（base 随之更新）
   } catch (e) {
     log('搜索接口出错:', e.message);
     sendGroupMsg(groupId, '服务暂时开小差了，过一会儿再发一次试试。');
-    return;
+    return false;
   }
   if (!items.length) {
     // 后端在网关抖动/半挂时可能直接返回空结果而不是报错（搜索内部有多源
@@ -361,7 +463,8 @@ async function handleSearch(groupId, keyword) {
     for (let retry = 1; retry <= EMPTY_RETRY_MAX && !items.length; retry++) {
       await new Promise(r => setTimeout(r, EMPTY_RETRY_GAP_MS));
       try {
-        items = await searchItems(keyword);
+        const r = await searchItems(base, keyword);
+        items = r.items; base = r.base;
         log(`空结果重试第 ${retry} 次:`, items.length, '条');
       } catch (e) {
         log(`空结果重试第 ${retry} 次出错:`, e.message);
@@ -371,7 +474,7 @@ async function handleSearch(groupId, keyword) {
   }
   if (!items.length) {
     sendGroupMsg(groupId, `没找到《${keyword}》，换个名字或者加上年份再试试。`);
-    return;
+    return false;
   }
   // 可提交转存的候选：优先夸克（后端目前只有夸克能真正转存成功）
   const withRef = items.filter(i => i && i.ref);
@@ -383,7 +486,7 @@ async function handleSearch(groupId, keyword) {
   const ready = pickBest(items.filter(i => itemShare(i) && !isNovelItem(i)), keyword);
   if (ready.item && (!fresh.item || ready.score >= fresh.score)) {
     sendGroupMsg(groupId, `《${itemTitle(ready.item, keyword)}》\n${itemShare(ready.item)}`);
-    return;
+    return false;
   }
 
   if (!fresh.item) {
@@ -391,15 +494,15 @@ async function handleSearch(groupId, keyword) {
     const anyReady = items.find(i => itemShare(i));
     if (anyReady) {
       sendGroupMsg(groupId, `《${itemTitle(anyReady, keyword)}》\n${itemShare(anyReady)}`);
-      return;
+      return false;
     }
     sendGroupMsg(groupId, `没找到《${keyword}》可用的资源，换个名字再试试。`);
-    return;
+    return false;
   }
   // 候选清一色是小说版：小说以后再搞，这次不转，群里说明白
   if (pool.every(i => isNovelItem(i))) {
     sendGroupMsg(groupId, `《${keyword}》只找到小说版，影视版暂时没有，小说以后再说。`);
-    return;
+    return false;
   }
   // 候选排名：分数从高到低，同分保持后端顺序（后端已按时间倒序，新资源
   // 在前）；按 ref 去重。小说版永不进候选——清一色小说时 ranked 为空，
@@ -415,15 +518,22 @@ async function handleSearch(groupId, keyword) {
   // 或转完没链接，都静默顺延到下一个候选。群里全程只有开头那一条
   // 「正在找」，不再出现「转存好了但没链接」这种误导话术。
   for (const cand of ranked.slice(0, MAX_CANDIDATE_TRIES)) {
-    const r = await tryCandidate(groupId, cand, keyword);
-    if (r === 'ok') return;
+    const r = await tryCandidate(groupId, base, cand, keyword);
+    if (r === 'ok') return false;
     if (r === 'filtered') {
       sendGroupMsg(groupId, `《${keyword}》这类内容被过滤了，换一部试试。`);
-      return;
+      return false;
+    }
+    if (r === 'netfail') {
+      // 本地后端中途断开：候选的 ref 是本地发的，不能拿去云端提交，
+      // 整轮作废，回去重新定 base 重搜（熔断已记，下一轮通常落到云端）。
+      markLocalDown();
+      return true;
     }
     // 'fail'：这个候选不行，静默换下一个
   }
   sendGroupMsg(groupId, `《${keyword}》找到的几个源都不行，有的链接已经失效了，换个名字或者晚点再试试。`);
+  return false;
 }
 
 /* ---------------- 每日更新日报（21 点自动发群） ----------------
@@ -570,6 +680,73 @@ async function handleUpdate(groupId) {
   sendGroupMsg(groupId, '检查更新超时了，可能是网络不好，稍后再发一次「更新」试试。');
 }
 
+/* ---------------- 日志回传（主人专用） ----------------
+ * 群里主人发「日志」/「后端日志」：把 bot.log / backend.log 的最后 40 行
+ * 直接发回群里，省得排障时靠截图传日志。权限与「更新」一致：只有主人，
+ * 其他人静默忽略。两个日志都在 bot.js 同目录（手机上是 /root/qqbot/，
+ * backend.log 由本地后端的看门狗写）。每条消息 ≤1500 字符、最多 2 条：
+ * 内容超长时从最旧的行开始截断（保最新），并在开头注明已截断。含
+ * cookie 字样的行整行跳过（日志里本不该出现 cookie 值，防万一）。 */
+const LOG_TAIL_LINES = 40;
+const LOG_MSG_MAX_CHARS = 1500;
+const LOG_MAX_MSGS = 2;
+const BOT_LOG_PATH = path.join(__dirname, 'bot.log');
+const BACKEND_LOG_PATH = path.join(__dirname, 'backend.log');
+
+// 读日志文件的最后若干行：只读尾部一截字节，不整文件读进来；文件不存在返回 null
+function readLogTail(file, lines) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch { return null; }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const maxBytes = 128 * 1024; // 只回最后 40 行，尾部一截足够
+    const start = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    let text = buf.toString('utf8');
+    if (start > 0) { const nl = text.indexOf('\n'); text = nl >= 0 ? text.slice(nl + 1) : ''; } // 丢掉被截断的半行
+    const all = text.split('\n');
+    if (all.length && all[all.length - 1] === '') all.pop(); // 文件末尾的换行不算一行
+    return all.slice(-lines);
+  } catch { return null; }
+  finally { try { fs.closeSync(fd); } catch { /* 忽略 */ } }
+}
+
+// 把日志行拼成最多 LOG_MAX_MSGS 条、每条 ≤LOG_MSG_MAX_CHARS 的消息（保最新）
+function packLogMessages(lines) {
+  const NOTE = '（日志太长，前面已截断，只显示最近的部分）';
+  const budget = LOG_MSG_MAX_CHARS * LOG_MAX_MSGS;
+  let kept = lines.slice();
+  let text = kept.join('\n');
+  let truncated = false;
+  while (kept.length > 1 && text.length > budget) { kept.shift(); text = kept.join('\n'); truncated = true; }
+  if (truncated) {
+    while (kept.length > 1 && text.length > budget - NOTE.length - 1) { kept.shift(); text = kept.join('\n'); }
+    text = NOTE + '\n' + text;
+    if (text.length > budget) text = NOTE + '\n' + text.slice(-(budget - NOTE.length - 1)); // 单行超长的兜底硬截
+  }
+  if (text.length <= LOG_MSG_MAX_CHARS) return [text];
+  // 拆两条：第二条装最新的一截（从某行行首开始、≤1500），第一条装剩下的
+  let cut = text.length - LOG_MSG_MAX_CHARS;
+  const nl = text.indexOf('\n', cut);
+  if (nl >= 0 && nl + 1 < text.length) cut = nl + 1;
+  let first = text.slice(0, cut).replace(/\n$/, '');
+  if (first.length > LOG_MSG_MAX_CHARS) first = first.slice(0, LOG_MSG_MAX_CHARS);
+  return [first, text.slice(cut)];
+}
+
+function handleLogRequest(groupId, kind) {
+  const isBackend = kind === 'backend';
+  const lines = readLogTail(isBackend ? BACKEND_LOG_PATH : BOT_LOG_PATH, LOG_TAIL_LINES);
+  if (lines == null) {
+    sendGroupMsg(groupId, isBackend ? '后端日志不存在（本地后端没在这一栈跑）' : '机器人日志不存在（bot.log 没找到）');
+    return;
+  }
+  const safe = lines.filter(l => !l.toLowerCase().includes('cookie')); // 含 cookie 字样的行整行不回
+  if (!safe.length) { sendGroupMsg(groupId, isBackend ? '后端日志是空的。' : '机器人日志是空的。'); return; }
+  for (const msg of packLogMessages(safe)) sendGroupMsg(groupId, msg);
+}
+
 function onEvent(ev) {
   if (!ev || ev.post_type !== 'message' || ev.message_type !== 'group') return;
   if (ev.user_id != null && ev.self_id != null && String(ev.user_id) === String(ev.self_id)) return; // 忽略自己发的
@@ -585,6 +762,11 @@ function onEvent(ev) {
   if (text === '更新' || text === '检查更新') {
     if (String(ev.user_id) !== OWNER_ID) return; // 只有主人能触发，别人静默忽略
     handleUpdate(groupId).catch(e => log('处理更新命令出错:', e && e.message));
+    return;
+  }
+  if (text === '日志' || text === '后端日志') {
+    if (String(ev.user_id) !== OWNER_ID) return; // 只有主人能看日志，别人静默忽略
+    handleLogRequest(groupId, text === '后端日志' ? 'backend' : 'bot');
     return;
   }
   const m = text.match(/^(?:搜|找)\s*(.+)$/s);
@@ -630,6 +812,6 @@ function connect() {
   sock.addEventListener('error', () => { try { sock.close(); } catch { /* 忽略 */ } });
 }
 
-log('机器人启动，后端地址:', BACKEND);
+log(`机器人启动，后端：本地优先 ${BACKEND_LOCAL}，云端兜底 ${BACKEND_CLOUD}`);
 connect();
 startDigestPoster();
