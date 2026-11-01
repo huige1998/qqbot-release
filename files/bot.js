@@ -40,16 +40,71 @@ if (typeof WebSocket === 'undefined') {
  * 同一台机器只允许一个 bot.js 持有锁，第二个实例直接退出。
  * 锁文件默认在 bot.js 同目录（手机上即 /root/qqbot/bot.lock，与 bot.log 同目录；
  * Windows 一键包里就是 bot.js 旁边），可用环境变量 QQBOT_LOCK_PATH 覆盖。
- * 注意（pid 回收的极小概率）：失效锁里记的旧 pid 可能被系统分给无关进程，
- * 那时后来者会误判「已有实例在运行」而退出——看门狗 5 秒后会再拉起重试，
- * 最坏只是晚一轮接管，绝不会出现双实例。 */
+ *
+ * v7（2026-11-01）修 pid 回收陷阱：v4 只用 kill(pid,0) 判持有者死活。真机实锤：
+ * 一个 bot 实例在 NapCat 的 3001 还没起来时启动、随后死掉，它的 pid 被 chroot 里
+ * 一个长命无关进程回收占用——锁里记着这个 pid，kill(pid,0) 永远说"活着"，
+ * 看门狗每 5 秒拉起的新实例全部误判「已有实例在运行」退出，机器人死了几小时
+ * 无人接管。现在判持有者要验身份，两条都过才认：
+ *   1) /proc/<pid>/cmdline：argv[0] 含 node，且某个参数与本进程 bot.js 的
+ *      路径完全相等（与脚本侧清扫的精确令牌匹配同一套语义）；
+ *   2) 锁里记了持有者的启动节拍（/proc/<pid>/stat 第 22 字段）时，必须与
+ *      当前读数一致——pid 就算被回收给另一个进程也对不上节拍。
+ * 身份对不上（已死 / 不是 bot.js / 节拍不符）一律当失效锁接管并记一行；
+ * 只有"活着但 /proc 读不到、验不了"（含非 Linux 平台）才保守按已有实例退出，
+ * 防真双开的底线不变。锁内容为 JSON {pid, start}；v6 及更早写下的纯 pid
+ * 锁文件也能读（没有 start 就只验 cmdline）。 */
 const LOCK_PATH = process.env.QQBOT_LOCK_PATH || path.join(__dirname, 'bot.lock');
+const SELF_PATH = __filename; // 本进程 bot.js 的绝对路径，验持有者身份的令牌
 let lockFd = null; // 非 null 表示本进程是锁持有者
 
 function pidAlive(pid) {
   if (!pid || !Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; }
   catch (e) { return !!(e && e.code === 'EPERM'); } // EPERM = 进程在，只是无权发信号
+}
+
+// /proc/<pid>/stat 第 22 字段：进程启动节拍（相对开机的 clock ticks）；读不到返回 null
+function procStarttime(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    return rest[19] || null; // rest[0] 是字段 3(state)，字段 22 落在下标 19
+  } catch { return null; }
+}
+
+// 读锁文件：成功返回 {pid, start|null}；文件读不到或内容无法解析返回 null
+function readLockPayload() {
+  let raw;
+  try { raw = fs.readFileSync(LOCK_PATH, 'utf8').trim(); } catch { return null; }
+  if (!raw) return null;
+  try {
+    const j = JSON.parse(raw);
+    if (j && Number.isInteger(j.pid) && j.pid > 0) {
+      return { pid: j.pid, start: j.start != null ? String(j.start) : null };
+    }
+  } catch { /* 不是 JSON：按旧版纯 pid 格式继续解析 */ }
+  const pid = parseInt(raw, 10);
+  return (Number.isInteger(pid) && pid > 0) ? { pid, start: null } : null;
+}
+
+// 判定锁里记的持有者：'bot' = 确是 bot.js 实例；'stale' = 可接管的失效锁；
+// 'unknown' = 活着但验不了身份（/proc 读不到等），保守处理
+function lockOwnerVerdict(pid, recordedStart) {
+  if (!pidAlive(pid)) return 'stale'; // kill(pid,0) 明确说进程不存在
+  if (process.platform !== 'linux') return 'unknown'; // 没有 /proc 可验，回到只判死活
+  let cmdline;
+  try { cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); }
+  catch (e) { return e && e.code === 'ENOENT' ? 'stale' : 'unknown'; } // ENOENT = 刚消失
+  const tokens = cmdline.split('\0').filter(Boolean);
+  const looksLikeBot = tokens.length > 0 && tokens[0].includes('node') && tokens.includes(SELF_PATH);
+  if (!looksLikeBot) return 'stale'; // 活着，但根本不是 bot.js：pid 被回收了
+  if (recordedStart != null) {
+    const actual = procStarttime(pid);
+    if (actual == null) return pidAlive(pid) ? 'unknown' : 'stale';
+    if (String(actual) !== String(recordedStart)) return 'stale'; // 节拍对不上：pid 已易主
+  }
+  return 'bot';
 }
 
 function acquireInstanceLock() {
@@ -59,13 +114,15 @@ function acquireInstanceLock() {
       fd = fs.openSync(LOCK_PATH, 'wx'); // O_EXCL 原子创建，已存在直接抛 EEXIST
     } catch (e) {
       if (e && e.code === 'EEXIST') {
-        let holder = NaN;
-        try { holder = parseInt(fs.readFileSync(LOCK_PATH, 'utf8').trim(), 10); } catch { /* 读不到按失效锁处理 */ }
-        if (pidAlive(holder)) {
-          log(`已有实例在运行 (pid ${holder})，本实例退出`);
+        const lock = readLockPayload();
+        const verdict = lock ? lockOwnerVerdict(lock.pid, lock.start) : 'stale';
+        if (verdict !== 'stale') {
+          // 'bot'：真有实例在跑；'unknown'：活着但验不了，保守按真实例处理
+          log(`已有实例在运行 (pid ${lock.pid})，本实例退出`);
           process.exit(0);
         }
-        // 失效锁（持有者已死或内容不可解析）：删掉重试一次，接管过来
+        // 失效锁（持有者已死、pid 被无关进程回收、或内容不可解析）：删掉接管
+        if (lock) log(`锁残留（pid ${lock.pid} 非机器人进程），接管`);
         try { fs.unlinkSync(LOCK_PATH); } catch { /* 别人先删了也无妨 */ }
         continue;
       }
@@ -73,7 +130,9 @@ function acquireInstanceLock() {
       log('单实例锁创建失败（继续无锁启动）:', e && e.message);
       return;
     }
-    try { fs.writeSync(fd, String(process.pid)); } catch { /* 写不进不影响占锁本身 */ }
+    try {
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, start: procStarttime(process.pid) }));
+    } catch { /* 写不进不影响占锁本身 */ }
     lockFd = fd;
     return;
   }
